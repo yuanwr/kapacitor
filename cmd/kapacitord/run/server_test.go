@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/influxdata/config"
 	"github.com/influxdata/kapacitor"
 	"github.com/influxdata/kapacitor/cmd/kapacitord/run"
 	"github.com/influxdata/kapacitor/services/udf"
 	"github.com/influxdb/influxdb/client"
 	"github.com/influxdb/influxdb/influxql"
 	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/toml"
 )
 
 func TestServer_Ping(t *testing.T) {
@@ -714,7 +714,7 @@ func TestServer_UDFAgents(t *testing.T) {
 			config: udf.FunctionConfig{
 				Prog:    "go",
 				Args:    []string{"run", filepath.Join(udfDir, "agent/examples/moving_avg.go")},
-				Timeout: toml.Duration(time.Minute),
+				Timeout: config.Duration(time.Minute),
 			},
 		},
 		// Python
@@ -723,7 +723,7 @@ func TestServer_UDFAgents(t *testing.T) {
 			config: udf.FunctionConfig{
 				Prog:    "python2",
 				Args:    []string{"-u", filepath.Join(udfDir, "agent/examples/moving_avg.py")},
-				Timeout: toml.Duration(time.Minute),
+				Timeout: config.Duration(time.Minute),
 				Env: map[string]string{
 					"PYTHONPATH": strings.Join(
 						[]string{filepath.Join(udfDir, "agent/py"), os.Getenv("PYTHONPATH")},

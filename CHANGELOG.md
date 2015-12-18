@@ -20,6 +20,7 @@ This way you can easily tell which versions of Telegraf, InfluxDB, Chronograf an
 - [#72](https://github.com/influxdata/kapacitor/issues/72): Add support for User Defined Functions (UDFs).
 - [#138](https://github.com/influxdata/kapacitor/issues/138): Change over to influxdata github org.
 - [#139](https://github.com/influxdata/kapacitor/issues/139): Alerta.io support thanks! @md14454
+- [#155](https://github.com/influxdata/kapacitor/pull/155): Standardized config across TICK stack.
 
 ### Bugfixes
 
