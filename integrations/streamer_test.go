@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"text/template"
 	"time"
@@ -172,6 +174,77 @@ stream
 	}
 
 	testStreamerWithOutput(t, "TestStream_DerivativeNN", script, 15*time.Second, er, nil, false)
+}
+
+func TestStream_WindowMissing(t *testing.T) {
+
+	var script = `
+var period = 3s
+var every = 2s
+stream
+	.from()
+		.database('dbname')
+		.retentionPolicy('rpname')
+		.measurement('cpu')
+		.where(lambda: "host" == 'serverA')
+	.window()
+		.period(period)
+		.every(every)
+	.mapReduce(influxql.count('value'))
+	.httpOut('TestStream_WindowMissing')
+`
+
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "cpu",
+				Tags:    nil,
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 11, 0, time.UTC),
+					3.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_WindowMissing", script, 13*time.Second, er, nil, false)
+}
+
+func TestStream_WindowMissingAligned(t *testing.T) {
+
+	var script = `
+var period = 3s
+var every = 2s
+stream
+	.from()
+		.database('dbname')
+		.retentionPolicy('rpname')
+		.measurement('cpu')
+		.where(lambda: "host" == 'serverA')
+	.window()
+		.period(period)
+		.every(every)
+		.align()
+	.mapReduce(influxql.count('value'))
+	.httpOut('TestStream_WindowMissing')
+`
+
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "cpu",
+				Tags:    nil,
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					3.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_WindowMissing", script, 13*time.Second, er, nil, false)
 }
 
 func TestStream_Window(t *testing.T) {
@@ -459,6 +532,100 @@ stream
 	}
 
 	testStreamerWithOutput(t, "TestStream_SimpleMR", script, 15*time.Second, er, nil, false)
+}
+
+func TestStream_BatchGroupBy(t *testing.T) {
+
+	var script = `
+stream
+	.from().measurement('cpu')
+	.window()
+		.period(5s)
+		.every(5s)
+	.groupBy('host')
+	.mapReduce(influxql.count('value'))
+	.httpOut('TestStream_BatchGroupBy')
+`
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverA"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					5.0,
+				}},
+			},
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverB"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					5.0,
+				}},
+			},
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverC"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					1.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_BatchGroupBy", script, 15*time.Second, er, nil, true)
+}
+
+func TestStream_BatchGroupByAll(t *testing.T) {
+
+	var script = `
+stream
+	.from().measurement('cpu')
+	.window()
+		.period(5s)
+		.every(5s)
+	.groupBy(*)
+	.mapReduce(influxql.count('value'))
+	.httpOut('TestStream_BatchGroupBy')
+`
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverA", "type": "idle"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					5.0,
+				}},
+			},
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverB", "type": "idle"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					5.0,
+				}},
+			},
+			{
+				Name:    "cpu",
+				Tags:    map[string]string{"host": "serverC", "type": "idle"},
+				Columns: []string{"time", "count"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 5, 0, time.UTC),
+					1.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_BatchGroupBy", script, 15*time.Second, er, nil, true)
 }
 
 func TestStream_SimpleWhere(t *testing.T) {
@@ -831,6 +998,302 @@ cpu.join(mem, disk)
 	testStreamerWithOutput(t, "TestStream_JoinN", script, 15*time.Second, er, nil, false)
 }
 
+func TestStream_JoinOn(t *testing.T) {
+	var script = `
+var errorsByServiceDC = stream
+			.from().measurement('errors')
+			.groupBy('dc', 'service')
+			.window()
+				.period(10s)
+				.every(10s)
+				.align()
+			.mapReduce(influxql.sum('value'))
+
+var errorsByServiceGlobal = stream
+			.from().measurement('errors')
+			.groupBy('service')
+			.window()
+				.period(10s)
+				.every(10s)
+				.align()
+			.mapReduce(influxql.sum('value'))
+
+errorsByServiceGlobal.join(errorsByServiceDC)
+		.as('service', 'dc')
+		.on('service')
+		.streamName('dc_error_percent')
+	.eval(lambda: "dc.sum" / "service.sum")
+		.keep()
+		.as('value')
+	.httpOut('TestStream_JoinOn')
+`
+
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "cartA"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					15.0,
+					47.0,
+					15.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "cartA"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					32.0,
+					47.0,
+					32.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "login"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					15.0,
+					45.0,
+					15.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "login"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					23.0,
+					45.0,
+					23.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "C", "service": "login"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					7.0,
+					45.0,
+					7.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "front"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					19.0,
+					32.0,
+					19.0 / 32.0,
+				}},
+			},
+			{
+				Name:    "dc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "front"},
+				Columns: []string{"time", "dc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					13.0,
+					32.0,
+					13.0 / 32.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_JoinOn", script, 13*time.Second, er, nil, true)
+}
+
+func TestStream_JoinOnGap(t *testing.T) {
+	var script = `
+var errorsByServiceDCRack = stream
+			.from().measurement('errors')
+			.groupBy('dc', 'service', 'rack')
+			.window()
+				.period(10s)
+				.every(10s)
+				.align()
+			.mapReduce(influxql.sum('value'))
+
+var errorsByServiceGlobal = stream
+			.from().measurement('errors')
+			.groupBy('service')
+			.window()
+				.period(10s)
+				.every(10s)
+				.align()
+			.mapReduce(influxql.sum('value'))
+
+errorsByServiceGlobal.join(errorsByServiceDCRack)
+		.as('service', 'loc')
+		.on('service')
+		.streamName('loc_error_percent')
+	.eval(lambda: "loc.sum" / "service.sum")
+		.keep()
+		.as('value')
+	.httpOut('TestStream_JoinOn')
+`
+
+	er := kapacitor.Result{
+		Series: imodels.Rows{
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "cartA", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					10.0,
+					47.0,
+					10.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "cartA", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					5.0,
+					47.0,
+					5.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "cartA", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					14.0,
+					47.0,
+					14.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "cartA", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					18.0,
+					47.0,
+					18.0 / 47.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "login", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					5.0,
+					45.0,
+					5.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "login", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					10.0,
+					45.0,
+					10.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "login", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					3.0,
+					45.0,
+					3.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "login", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					20.0,
+					45.0,
+					20.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "C", "service": "login", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					7.0,
+					45.0,
+					7.0 / 45.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "front", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					9.0,
+					32.0,
+					9.0 / 32.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "A", "service": "front", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					10.0,
+					32.0,
+					10.0 / 32.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "front", "rack": "0"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					4.0,
+					32.0,
+					4.0 / 32.0,
+				}},
+			},
+			{
+				Name:    "loc_error_percent",
+				Tags:    map[string]string{"dc": "B", "service": "front", "rack": "1"},
+				Columns: []string{"time", "loc.sum", "service.sum", "value"},
+				Values: [][]interface{}{[]interface{}{
+					time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC),
+					9.0,
+					32.0,
+					9.0 / 32.0,
+				}},
+			},
+		},
+	}
+
+	testStreamerWithOutput(t, "TestStream_JoinOn", script, 13*time.Second, er, nil, true)
+}
+
 func TestStream_Union(t *testing.T) {
 
 	var script = `
@@ -870,7 +1333,7 @@ cpu.union(mem, disk)
 	testStreamerWithOutput(t, "TestStream_Union", script, 15*time.Second, er, nil, false)
 }
 
-func TestStream_Aggregations(t *testing.T) {
+func TestStream_InfluxQL(t *testing.T) {
 
 	type testCase struct {
 		Method        string
@@ -886,14 +1349,26 @@ stream
 	.window()
 		.period(10s)
 		.every(10s)
-	.mapReduce({{ .Method }}({{ .Args }}))
+	.mapReduce(influxql.{{ .Method }}({{ .Args }}))
 		{{ if .UsePointTimes }}.usePointTimes(){{ end }}
-	.httpOut('TestStream_Aggregations')
+	.httpOut('TestStream_InfluxQL')
+`
+
+	var newScriptTmpl = `
+stream
+	.from().measurement('cpu')
+	.where(lambda: "host" == 'serverA')
+	.window()
+		.period(10s)
+		.every(10s)
+	.{{ .Method }}({{ .Args }})
+		{{ if .UsePointTimes }}.usePointTimes(){{ end }}
+	.httpOut('TestStream_InfluxQL')
 `
 	endTime := time.Date(1971, 1, 1, 0, 0, 10, 0, time.UTC)
 	testCases := []testCase{
 		testCase{
-			Method: "influxql.sum",
+			Method: "sum",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -909,7 +1384,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.count",
+			Method: "count",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -925,7 +1400,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.distinct",
+			Method: "distinct",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -935,15 +1410,11 @@ stream
 						Values: [][]interface{}{
 							{
 								endTime,
+								98.0,
+							},
+							{
+								endTime,
 								91.0,
-							},
-							{
-								endTime,
-								92.0,
-							},
-							{
-								endTime,
-								93.0,
 							},
 							{
 								endTime,
@@ -951,11 +1422,15 @@ stream
 							},
 							{
 								endTime,
-								96.0,
+								93.0,
 							},
 							{
 								endTime,
-								98.0,
+								92.0,
+							},
+							{
+								endTime,
+								96.0,
 							},
 						},
 					},
@@ -963,7 +1438,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.mean",
+			Method: "mean",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -979,7 +1454,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.median",
+			Method: "median",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -995,7 +1470,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.min",
+			Method:        "min",
 			UsePointTimes: true,
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1012,7 +1487,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.min",
+			Method: "min",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1028,7 +1503,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.max",
+			Method:        "max",
 			UsePointTimes: true,
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1045,7 +1520,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.max",
+			Method: "max",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1061,7 +1536,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.spread",
+			Method: "spread",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1077,7 +1552,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.stddev",
+			Method: "stddev",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1093,7 +1568,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.first",
+			Method:        "first",
 			UsePointTimes: true,
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1110,7 +1585,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.first",
+			Method: "first",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1126,7 +1601,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.last",
+			Method:        "last",
 			UsePointTimes: true,
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1143,7 +1618,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.last",
+			Method: "last",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
 					{
@@ -1159,7 +1634,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.percentile",
+			Method: "percentile",
 			Args:   "'value', 50.0",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1176,7 +1651,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.top",
+			Method:        "top",
 			UsePointTimes: true,
 			Args:          "2, 'value'",
 			ER: kapacitor.Result{
@@ -1204,7 +1679,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.top",
+			Method: "top",
 			Args:   "2, 'value'",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1231,7 +1706,7 @@ stream
 			},
 		},
 		testCase{
-			Method:        "influxql.bottom",
+			Method:        "bottom",
 			UsePointTimes: true,
 			Args:          "3, 'value'",
 			ER: kapacitor.Result{
@@ -1265,7 +1740,7 @@ stream
 			},
 		},
 		testCase{
-			Method: "influxql.bottom",
+			Method: "bottom",
 			Args:   "3, 'value'",
 			ER: kapacitor.Result{
 				Series: imodels.Rows{
@@ -1304,22 +1779,35 @@ stream
 		t.Fatal(err)
 	}
 
+	newTmpl, err := template.New("script").Parse(newScriptTmpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tmpls := []*template.Template{tmpl, newTmpl}
+
 	for _, tc := range testCases {
-		t.Log("Method:", tc.Method)
-		var script bytes.Buffer
-		if tc.Args == "" {
-			tc.Args = "'value'"
+		for i, tmpl := range tmpls {
+			if tc.Method == "distinct" && i == 0 {
+				// Skip legacy test for new behavior
+				continue
+			}
+			t.Log("Method:", tc.Method, i)
+			var script bytes.Buffer
+			if tc.Args == "" {
+				tc.Args = "'value'"
+			}
+			tmpl.Execute(&script, tc)
+			testStreamerWithOutput(
+				t,
+				"TestStream_InfluxQL",
+				string(script.Bytes()),
+				13*time.Second,
+				tc.ER,
+				nil,
+				false,
+			)
 		}
-		tmpl.Execute(&script, tc)
-		testStreamerWithOutput(
-			t,
-			"TestStream_Aggregations",
-			string(script.Bytes()),
-			13*time.Second,
-			tc.ER,
-			nil,
-			false,
-		)
 	}
 }
 
@@ -1477,7 +1965,7 @@ stream
 
 func TestStream_Alert(t *testing.T) {
 
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ad := kapacitor.AlertData{}
 		dec := json.NewDecoder(r.Body)
@@ -1485,7 +1973,7 @@ func TestStream_Alert(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		expAd := kapacitor.AlertData{
 			ID:      "kapacitor/cpu/serverA",
 			Message: "kapacitor/cpu/serverA is CRITICAL",
@@ -1536,42 +2024,61 @@ stream
 
 	testStreamerNoOutput(t, "TestStream_Alert", script, 13*time.Second)
 
-	if requestCount != 1 {
-		t.Errorf("got %v exp %v", requestCount, 1)
+	if rc := atomic.LoadInt32(&requestCount); rc != 1 {
+		t.Errorf("got %v exp %v", rc, 1)
 	}
 }
 
 func TestStream_AlertSensu(t *testing.T) {
-	requestCount := 0
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		type postData struct {
-			Name   string `json:"name"`
-			Source string `json:"source"`
-			Output string `json:"output"`
-			Status int    `json:"status"`
-		}
-		pd := postData{}
-		dec := json.NewDecoder(r.Body)
-		dec.Decode(&pd)
+	requestCount := int32(0)
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listen, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listen.Close()
+	go func() {
+		for {
+			conn, err := listen.Accept()
+			if err != nil {
+				t.Log(err)
+				return
+			}
+			func() {
+				defer conn.Close()
 
-		if exp := "Kapacitor"; pd.Source != exp {
-			t.Errorf("unexpected source got %s exp %s", pd.Source, exp)
-		}
+				atomic.AddInt32(&requestCount, 1)
+				type postData struct {
+					Name   string `json:"name"`
+					Source string `json:"source"`
+					Output string `json:"output"`
+					Status int    `json:"status"`
+				}
+				pd := postData{}
+				dec := json.NewDecoder(conn)
+				dec.Decode(&pd)
 
-		if exp := "kapacitor/cpu/serverA is CRITICAL"; pd.Output != exp {
-			t.Errorf("unexpected text got %s exp %s", pd.Output, exp)
-		}
+				if exp := "Kapacitor"; pd.Source != exp {
+					t.Errorf("unexpected source got %s exp %s", pd.Source, exp)
+				}
 
-		if exp := "kapacitor/cpu/serverA"; pd.Name != exp {
-			t.Errorf("unexpected text got %s exp %s", pd.Name, exp)
-		}
+				if exp := "kapacitor.cpu.serverA is CRITICAL"; pd.Output != exp {
+					t.Errorf("unexpected text got %s exp %s", pd.Output, exp)
+				}
 
-		if exp := 2; pd.Status != exp {
-			t.Errorf("unexpected status got %v exp %v", pd.Status, exp)
+				if exp := "kapacitor.cpu.serverA"; pd.Name != exp {
+					t.Errorf("unexpected text got %s exp %s", pd.Name, exp)
+				}
+
+				if exp := 2; pd.Status != exp {
+					t.Errorf("unexpected status got %v exp %v", pd.Status, exp)
+				}
+			}()
 		}
-	}))
-	defer ts.Close()
+	}()
 
 	var script = `
 stream
@@ -1583,7 +2090,7 @@ stream
 		.every(10s)
 	.mapReduce(influxql.count('value'))
 	.alert()
-		.id('kapacitor/{{ .Name }}/{{ index .Tags "host" }}')
+		.id('kapacitor.{{ .Name }}.{{ index .Tags "host" }}')
 		.info(lambda: "count" > 6.0)
 		.warn(lambda: "count" > 7.0)
 		.crit(lambda: "count" > 8.0)
@@ -1594,25 +2101,25 @@ stream
 	defer tm.Close()
 
 	c := sensu.NewConfig()
-	c.URL = ts.URL
+	c.Addr = listen.Addr().String()
 	c.Source = "Kapacitor"
 	sl := sensu.NewService(c, logService.NewLogger("[test_sensu] ", log.LstdFlags))
 	tm.SensuService = sl
 
-	err := fastForwardTask(clock, et, replayErr, tm, 13*time.Second)
+	err = fastForwardTask(clock, et, replayErr, tm, 13*time.Second)
 	if err != nil {
 		t.Error(err)
 	}
 
-	if requestCount != 1 {
-		t.Errorf("unexpected requestCount got %d exp 1", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 1 {
+		t.Errorf("unexpected requestCount got %d exp 1", rc)
 	}
 }
 
 func TestStream_AlertSlack(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		type postData struct {
 			Channel     string `json:"channel"`
 			Username    string `json:"username"`
@@ -1629,11 +2136,11 @@ func TestStream_AlertSlack(t *testing.T) {
 		if exp := "/test/slack/url"; r.URL.String() != exp {
 			t.Errorf("unexpected url got %s exp %s", r.URL.String(), exp)
 		}
-		if requestCount == 1 {
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			if exp := "#alerts"; pd.Channel != exp {
 				t.Errorf("unexpected channel got %s exp %s", pd.Channel, exp)
 			}
-		} else if requestCount == 2 {
+		} else if rc := atomic.LoadInt32(&requestCount); rc == 2 {
 			if exp := "@jim"; pd.Channel != exp {
 				t.Errorf("unexpected channel got %s exp %s", pd.Channel, exp)
 			}
@@ -1695,15 +2202,15 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 2", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 2", rc)
 	}
 }
 
 func TestStream_AlertHipChat(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		type postData struct {
 			From    string `json:"from"`
 			Message string `json:"message"`
@@ -1714,11 +2221,11 @@ func TestStream_AlertHipChat(t *testing.T) {
 		dec := json.NewDecoder(r.Body)
 		dec.Decode(&pd)
 
-		if requestCount == 1 {
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			if exp := "/1234567/notification?auth_token=testtoken1234567"; r.URL.String() != exp {
 				t.Errorf("unexpected url got %s exp %s", r.URL.String(), exp)
 			}
-		} else if requestCount == 2 {
+		} else if rc := atomic.LoadInt32(&requestCount); rc == 2 {
 			if exp := "/Test%20Room/notification?auth_token=testtokenTestRoom"; r.URL.String() != exp {
 				t.Errorf("unexpected url got %s exp %s", r.URL.String(), exp)
 			}
@@ -1775,15 +2282,15 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 2", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 2", rc)
 	}
 }
 
 func TestStream_AlertAlerta(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		type postData struct {
 			Resource    string   `json:"resource"`
 			Event       string   `json:"event"`
@@ -1798,7 +2305,7 @@ func TestStream_AlertAlerta(t *testing.T) {
 		dec := json.NewDecoder(r.Body)
 		dec.Decode(&pd)
 
-		if requestCount == 1 {
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			if exp := "/alert?api-key=testtoken1234567"; r.URL.String() != exp {
 				t.Errorf("unexpected url got %s exp %s", r.URL.String(), exp)
 			}
@@ -1894,15 +2401,15 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 2", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 2", rc)
 	}
 }
 
 func TestStream_AlertOpsGenie(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 
 		type postData struct {
 			ApiKey      string                 `json:"apiKey"`
@@ -1938,7 +2445,7 @@ func TestStream_AlertOpsGenie(t *testing.T) {
 		if pd.Description == nil {
 			t.Error("unexpected description got nil")
 		}
-		if requestCount == 1 {
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			if exp, l := 2, len(pd.Teams); l != exp {
 				t.Errorf("unexpected teams count got %d exp %d", l, exp)
 			}
@@ -1957,7 +2464,7 @@ func TestStream_AlertOpsGenie(t *testing.T) {
 			if exp := "another_recipient"; pd.Recipients[1] != exp {
 				t.Errorf("unexpected recipients[1] got %s exp %s", pd.Recipients[1], exp)
 			}
-		} else if requestCount == 2 {
+		} else if rc := atomic.LoadInt32(&requestCount); rc == 2 {
 			if exp, l := 1, len(pd.Teams); l != exp {
 				t.Errorf("unexpected teams count got %d exp %d", l, exp)
 			}
@@ -2012,15 +2519,15 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 1", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 1", rc)
 	}
 }
 
 func TestStream_AlertPagerDuty(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		type postData struct {
 			ServiceKey  string      `json:"service_key"`
 			EventType   string      `json:"event_type"`
@@ -2086,20 +2593,20 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 1", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 1", rc)
 	}
 }
 
 func TestStream_AlertVictorOps(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		if requestCount == 1 {
+		atomic.AddInt32(&requestCount, 1)
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			if exp, got := "/api_key/test_key", r.URL.String(); got != exp {
 				t.Errorf("unexpected VO url got %s exp %s", got, exp)
 			}
-		} else if requestCount == 2 {
+		} else if rc := atomic.LoadInt32(&requestCount); rc == 2 {
 			if exp, got := "/api_key/test_key2", r.URL.String(); got != exp {
 				t.Errorf("unexpected VO url got %s exp %s", got, exp)
 			}
@@ -2170,15 +2677,15 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 2 {
-		t.Errorf("unexpected requestCount got %d exp 1", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("unexpected requestCount got %d exp 1", rc)
 	}
 }
 
 func TestStream_AlertTalk(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		type postData struct {
 			Title      string `json:"title"`
 			Text       string `json:"text"`
@@ -2234,13 +2741,13 @@ stream
 		t.Error(err)
 	}
 
-	if requestCount != 1 {
-		t.Errorf("unexpected requestCount got %d exp 1", requestCount)
+	if rc := atomic.LoadInt32(&requestCount); rc != 1 {
+		t.Errorf("unexpected requestCount got %d exp 1", rc)
 	}
 }
 
 func TestStream_AlertSigma(t *testing.T) {
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ad := kapacitor.AlertData{}
 		dec := json.NewDecoder(r.Body)
@@ -2248,8 +2755,8 @@ func TestStream_AlertSigma(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requestCount++
-		if requestCount == 1 {
+		atomic.AddInt32(&requestCount, 1)
+		if rc := atomic.LoadInt32(&requestCount); rc == 1 {
 			expAd := kapacitor.AlertData{
 				ID:      "cpu:nil",
 				Message: "cpu:nil is INFO",
@@ -2318,30 +2825,16 @@ stream
 		.post('` + ts.URL + `')
 `
 
-	clock, et, replayErr, tm := testStreamer(t, "TestStream_AlertSigma", script, nil)
-	defer tm.Close()
+	testStreamerNoOutput(t, "TestStream_AlertSigma", script, 13*time.Second)
 
-	// Move time forward
-	clock.Set(clock.Zero().Add(13 * time.Second))
-	// Wait till the replay has finished
-	if e := <-replayErr; e != nil {
-		t.Error(e)
-	}
-	// We don't want anymore data for the task
-	tm.DelFork(et.Task.Name)
-	// Wait till the task is finished
-	if e := et.Err(); e != nil {
-		t.Error(e)
-	}
-
-	if requestCount != 2 {
-		t.Errorf("got %v exp %v", requestCount, 2)
+	if rc := atomic.LoadInt32(&requestCount); rc != 2 {
+		t.Errorf("got %v exp %v", rc, 2)
 	}
 }
 
 func TestStream_AlertComplexWhere(t *testing.T) {
 
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ad := kapacitor.AlertData{}
 		dec := json.NewDecoder(r.Body)
@@ -2349,7 +2842,7 @@ func TestStream_AlertComplexWhere(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 		expAd := kapacitor.AlertData{
 			ID:      "cpu:nil",
 			Message: "cpu:nil is CRITICAL",
@@ -2388,16 +2881,16 @@ stream
 
 	testStreamerNoOutput(t, "TestStream_AlertComplexWhere", script, 13*time.Second)
 
-	if requestCount != 1 {
-		t.Errorf("got %v exp %v", requestCount, 1)
+	if rc := atomic.LoadInt32(&requestCount); rc != 1 {
+		t.Errorf("got %v exp %v", rc, 1)
 	}
 }
 
 func TestStream_AlertStateChangesOnly(t *testing.T) {
 
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 	}))
 	defer ts.Close()
 	var script = `
@@ -2412,16 +2905,16 @@ stream
 	testStreamerNoOutput(t, "TestStream_AlertStateChangesOnly", script, 13*time.Second)
 
 	// Only 4 points below 93 so 8 state changes.
-	if requestCount != 8 {
-		t.Errorf("got %v exp %v", requestCount, 5)
+	if rc := atomic.LoadInt32(&requestCount); rc != 8 {
+		t.Errorf("got %v exp %v", rc, 5)
 	}
 }
 
 func TestStream_AlertFlapping(t *testing.T) {
 
-	requestCount := 0
+	requestCount := int32(0)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
+		atomic.AddInt32(&requestCount, 1)
 	}))
 	defer ts.Close()
 	var script = `
@@ -2440,8 +2933,8 @@ stream
 	testStreamerNoOutput(t, "TestStream_AlertFlapping", script, 13*time.Second)
 
 	// Flapping detection should drop the last alerts.
-	if requestCount != 9 {
-		t.Errorf("got %v exp %v", requestCount, 9)
+	if rc := atomic.LoadInt32(&requestCount); rc != 9 {
+		t.Errorf("got %v exp %v", rc, 9)
 	}
 }
 
@@ -2469,6 +2962,10 @@ stream
 	var precision string
 
 	influxdb := NewMockInfluxDBService(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ping" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		//Respond
 		var data client.Response
 		w.WriteHeader(http.StatusOK)
@@ -2547,7 +3044,7 @@ var topScores = stream
     .mapReduce(influxql.last('value'))
     // Calculate the top 5 scores per game
     .groupBy('game')
-    .mapReduce(influxql.top(5, 'last', 'player'))
+    .top(5, 'last', 'player')
 
 topScores
     .httpOut('top_scores')

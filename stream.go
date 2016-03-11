@@ -8,6 +8,33 @@ import (
 	"github.com/influxdata/kapacitor/tick"
 )
 
+type SourceStreamNode struct {
+	node
+	s *pipeline.SourceStreamNode
+}
+
+// Create a new  SourceStreamNode which copies all data to children
+func newSourceStreamNode(et *ExecutingTask, n *pipeline.SourceStreamNode, l *log.Logger) (*SourceStreamNode, error) {
+	sn := &SourceStreamNode{
+		node: node{Node: n, et: et, logger: l},
+		s:    n,
+	}
+	sn.node.runF = sn.runSourceStream
+	return sn, nil
+}
+
+func (s *SourceStreamNode) runSourceStream([]byte) error {
+	for pt, ok := s.ins[0].NextPoint(); ok; pt, ok = s.ins[0].NextPoint() {
+		for _, child := range s.outs {
+			err := child.CollectPoint(pt)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 type StreamNode struct {
 	node
 	s             *pipeline.StreamNode
@@ -40,18 +67,22 @@ func newStreamNode(et *ExecutingTask, n *pipeline.StreamNode, l *log.Logger) (*S
 
 func (s *StreamNode) runStream([]byte) error {
 	for pt, ok := s.ins[0].NextPoint(); ok; pt, ok = s.ins[0].NextPoint() {
+		s.timer.Start()
 		if s.matches(pt) {
 			if s.s.Truncate != 0 {
 				pt.Time = pt.Time.Truncate(s.s.Truncate)
 			}
 			pt = setGroupOnPoint(pt, s.allDimensions, s.dimensions)
+			s.timer.Pause()
 			for _, child := range s.outs {
 				err := child.CollectPoint(pt)
 				if err != nil {
 					return err
 				}
 			}
+			s.timer.Resume()
 		}
+		s.timer.Stop()
 	}
 	return nil
 }

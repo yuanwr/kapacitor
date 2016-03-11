@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,7 +49,7 @@ type Service struct {
 		StartTask(t *kapacitor.Task) (*kapacitor.ExecutingTask, error)
 		StopTask(name string) error
 		IsExecuting(name string) bool
-		ExecutingDot(name string) string
+		ExecutingDot(name string, labels bool) string
 	}
 
 	logger *log.Logger
@@ -106,6 +107,13 @@ func (ts *Service) Open() error {
 			Method:      "DELETE",
 			Pattern:     "/task",
 			HandlerFunc: ts.handleDelete,
+		},
+		{
+			// Satisfy CORS checks.
+			Name:        "task-delete",
+			Method:      "OPTIONS",
+			Pattern:     "/task",
+			HandlerFunc: httpd.ServeOptions,
 		},
 		{
 			Name:        "task-enable",
@@ -177,8 +185,8 @@ func (ts *Service) Open() error {
 	}
 
 	// Set expvars
-	kapacitor.NumTasks.Set(numTasks)
-	kapacitor.NumEnabledTasks.Set(numEnabledTasks)
+	kapacitor.NumTasksVar.Set(numTasks)
+	kapacitor.NumEnabledTasksVar.Set(numEnabledTasks)
 	return nil
 }
 
@@ -271,6 +279,17 @@ func (ts *Service) handleTask(w http.ResponseWriter, r *http.Request) {
 		httpd.HttpError(w, "must pass task name", true, http.StatusBadRequest)
 		return
 	}
+	labels := false
+	labelsStr := r.URL.Query().Get("labels")
+	if labelsStr != "" {
+		var err error
+		labels, err = strconv.ParseBool(labelsStr)
+		if err != nil {
+			httpd.HttpError(w, "invalid labels value:", true, http.StatusBadRequest)
+			return
+		}
+
+	}
 
 	raw, err := ts.LoadRaw(name)
 	if err != nil {
@@ -284,7 +303,7 @@ func (ts *Service) handleTask(w http.ResponseWriter, r *http.Request) {
 	task, err := ts.Load(name)
 	if err == nil {
 		if executing {
-			dot = ts.TaskMaster.ExecutingDot(name)
+			dot = ts.TaskMaster.ExecutingDot(name, labels)
 		} else {
 			dot = string(task.Dot())
 		}
@@ -484,7 +503,7 @@ func (ts *Service) Save(task *rawTask) error {
 			return err
 		}
 		if !exists {
-			kapacitor.NumTasks.Add(1)
+			kapacitor.NumTasksVar.Add(1)
 		}
 		return nil
 	})
@@ -500,7 +519,7 @@ func (ts *Service) Delete(name string) error {
 			exists := tb.Get([]byte(name)) != nil
 			if exists {
 				tb.Delete([]byte(name))
-				kapacitor.NumTasks.Add(-1)
+				kapacitor.NumTasksVar.Add(-1)
 			}
 		}
 		eb := tx.Bucket(enabledBucket)
@@ -573,7 +592,7 @@ func (ts *Service) Enable(name string) error {
 			return err
 		}
 		if !enabled {
-			kapacitor.NumEnabledTasks.Add(1)
+			kapacitor.NumEnabledTasksVar.Add(1)
 		}
 		return nil
 	})
@@ -654,7 +673,7 @@ func (ts *Service) Disable(name string) error {
 			if err != nil {
 				return err
 			}
-			kapacitor.NumEnabledTasks.Add(-1)
+			kapacitor.NumEnabledTasksVar.Add(-1)
 		}
 		return nil
 	})

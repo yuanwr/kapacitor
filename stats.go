@@ -46,15 +46,24 @@ func (s *StatsNode) runStats([]byte) error {
 		case <-s.closing:
 			return nil
 		case now := <-ticker.C:
+			s.timer.Start()
 			point.Time = now.UTC()
-			count := s.en.collectedCount()
-			point.Fields = models.Fields{"collected": count}
-			for _, out := range s.outs {
-				err := out.CollectPoint(point)
-				if err != nil {
-					return err
+			stats := s.en.nodeStatsByGroup()
+			for group, stat := range stats {
+				point.Fields = stat.Fields
+				point.Group = group
+				point.Dimensions = stat.Dimensions
+				point.Tags = stat.Tags
+				s.timer.Pause()
+				for _, out := range s.outs {
+					err := out.CollectPoint(point)
+					if err != nil {
+						return err
+					}
 				}
+				s.timer.Resume()
 			}
+			s.timer.Stop()
 		}
 	}
 }

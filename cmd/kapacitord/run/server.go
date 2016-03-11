@@ -2,7 +2,6 @@ package run
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -44,27 +43,6 @@ import (
 
 const clusterIDFilename = "cluster.id"
 const serverIDFilename = "server.id"
-
-var (
-	//Published vars
-	cidVar = &expvar.String{}
-
-	sidVar = &expvar.String{}
-
-	hostVar = &expvar.String{}
-
-	productVar = &expvar.String{}
-
-	versionVar = &expvar.String{}
-)
-
-func init() {
-	expvar.Publish(kapacitor.ClusterIDVarName, cidVar)
-	expvar.Publish(kapacitor.ServerIDVarName, sidVar)
-	expvar.Publish(kapacitor.HostVarName, hostVar)
-	expvar.Publish(kapacitor.ProductVarName, productVar)
-	expvar.Publish(kapacitor.VersionVarName, versionVar)
-}
 
 // BuildInfo represents the build details for the server code.
 type BuildInfo struct {
@@ -125,6 +103,19 @@ func NewServer(c *Config, buildInfo *BuildInfo, logService logging.Interface) (*
 	}
 	s.Logger.Println("I! Kapacitor hostname:", s.hostname)
 
+	// Setup IDs
+	err = s.setupIDs()
+	if err != nil {
+		return nil, err
+	}
+	// Set published vars
+	kapacitor.ClusterIDVar.Set(s.ClusterID)
+	kapacitor.ServerIDVar.Set(s.ServerID)
+	kapacitor.HostVar.Set(s.hostname)
+	kapacitor.ProductVar.Set(kapacitor.Product)
+	kapacitor.VersionVar.Set(s.buildInfo.Version)
+	s.Logger.Printf("I! ClusterID: %s ServerID: %s", s.ClusterID, s.ServerID)
+
 	// Start Task Master
 	s.TaskMaster = kapacitor.NewTaskMaster(logService)
 	if err := s.TaskMaster.Open(); err != nil {
@@ -135,7 +126,7 @@ func NewServer(c *Config, buildInfo *BuildInfo, logService logging.Interface) (*
 	s.appendUDFService(c.UDF)
 	s.appendDeadmanService(c.Deadman)
 	s.appendSMTPService(c.SMTP)
-	s.appendHTTPDService(c.HTTP)
+	s.initHTTPDService(c.HTTP)
 	s.appendInfluxDBService(c.InfluxDB, c.Hostname)
 	s.appendTaskStoreService(c.Task)
 	s.appendReplayStoreService(c.Replay)
@@ -167,6 +158,9 @@ func NewServer(c *Config, buildInfo *BuildInfo, logService logging.Interface) (*
 	s.appendStatsService(c.Stats)
 	s.appendReportingService(c.Reporting)
 
+	// Append HTTPD Service last
+	s.appendHTTPDService()
+
 	return s, nil
 }
 
@@ -193,7 +187,7 @@ func (s *Server) appendInfluxDBService(c influxdb.Config, hostname string) {
 	}
 }
 
-func (s *Server) appendHTTPDService(c httpd.Config) {
+func (s *Server) initHTTPDService(c httpd.Config) {
 	l := s.LogService.NewLogger("[httpd] ", log.LstdFlags)
 	srv := httpd.NewService(c, l)
 
@@ -203,7 +197,10 @@ func (s *Server) appendHTTPDService(c httpd.Config) {
 
 	s.HTTPDService = srv
 	s.TaskMaster.HTTPDService = srv
-	s.Services = append(s.Services, srv)
+}
+
+func (s *Server) appendHTTPDService() {
+	s.Services = append(s.Services, s.HTTPDService)
 }
 
 func (s *Server) appendTaskStoreService(c task_store.Config) {
@@ -377,6 +374,7 @@ func (s *Server) appendStatsService(c stats.Config) {
 		srv := stats.NewService(c, l)
 		srv.TaskMaster = s.TaskMaster
 
+		s.TaskMaster.TimingService = srv
 		s.Services = append(s.Services, srv)
 	}
 }
@@ -406,19 +404,6 @@ func (s *Server) Err() <-chan error { return s.err }
 // Open opens all the services.
 func (s *Server) Open() error {
 	if err := func() error {
-		// Setup IDs
-		err := s.setupIDs()
-		if err != nil {
-			return err
-		}
-
-		// Set published vars
-		cidVar.Set(s.ClusterID)
-		sidVar.Set(s.ServerID)
-		hostVar.Set(s.hostname)
-		productVar.Set(kapacitor.Product)
-		versionVar.Set(s.buildInfo.Version)
-		s.Logger.Printf("I! ClusterID: %s ServerID: %s", s.ClusterID, s.ServerID)
 
 		// Start profiling, if set.
 		s.startProfile(s.CPUProfile, s.MemProfile)

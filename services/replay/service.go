@@ -20,7 +20,7 @@ import (
 	"github.com/influxdata/kapacitor/clock"
 	"github.com/influxdata/kapacitor/models"
 	"github.com/influxdata/kapacitor/services/httpd"
-	"github.com/influxdb/influxdb/client"
+	client "github.com/influxdb/influxdb/client/v2"
 	"github.com/influxdb/influxdb/influxql"
 	"github.com/twinj/uuid"
 )
@@ -42,7 +42,7 @@ type Service struct {
 		DelRoutes([]httpd.Route)
 	}
 	InfluxDBService interface {
-		NewClient() (*client.Client, error)
+		NewClient() (client.Client, error)
 	}
 	TaskMaster interface {
 		NewFork(name string, dbrps []kapacitor.DBRP) (*kapacitor.Edge, error)
@@ -79,6 +79,12 @@ func (r *Service) Open() error {
 			Method:      "DELETE",
 			Pattern:     "/recording",
 			HandlerFunc: r.handleDelete,
+		},
+		{
+			Name:        "recording-delete",
+			Method:      "OPTIONS",
+			Pattern:     "/recording",
+			HandlerFunc: httpd.ServeOptions,
 		},
 		{
 			Name:        "record",
@@ -347,7 +353,7 @@ func (r *Service) handleRecord(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	// Store recording in running recordings.
-	errC := make(chan error, 1)
+	errC := make(chan error)
 	func() {
 		r.recordingsMu.Lock()
 		defer r.recordingsMu.Unlock()
@@ -361,7 +367,11 @@ func (r *Service) handleRecord(w http.ResponseWriter, req *http.Request) {
 			// Always log an error since the user may not have requested the error.
 			r.logger.Printf("E! recording %s failed: %v", rid.String(), err)
 		}
-		errC <- err
+		select {
+		case errC <- err:
+		case <-time.After(time.Minute):
+			// Cache the error for a max duration then drop it
+		}
 		// We have finished delete from running map
 		r.recordingsMu.Lock()
 		defer r.recordingsMu.Unlock()
@@ -695,8 +705,8 @@ func (r *Service) doRecordBatch(rid uuid.UUID, t *kapacitor.Task, start, stop ti
 			if err != nil {
 				return err
 			}
-			if resp.Err != nil {
-				return resp.Err
+			if err := resp.Error(); err != nil {
+				return err
 			}
 			for _, res := range resp.Results {
 				batches, err := models.ResultToBatches(res)
@@ -728,6 +738,9 @@ func (r *Service) doRecordQuery(rid uuid.UUID, q string, tt kapacitor.TaskType) 
 	if db == "" || rp == "" {
 		return errors.New("could not determine database and retention policy. Is the query fully qualified?")
 	}
+	if r.InfluxDBService == nil {
+		return errors.New("InfluxDB not configured, cannot record query")
+	}
 	// Query InfluxDB
 	con, err := r.InfluxDBService.NewClient()
 	if err != nil {
@@ -740,8 +753,8 @@ func (r *Service) doRecordQuery(rid uuid.UUID, q string, tt kapacitor.TaskType) 
 	if err != nil {
 		return err
 	}
-	if resp.Err != nil {
-		return resp.Err
+	if err := resp.Error(); err != nil {
+		return err
 	}
 	// Open appropriate writer
 	var w io.Writer

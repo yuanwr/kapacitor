@@ -2,12 +2,22 @@ package kapacitor
 
 import (
 	"bytes"
+	"expvar"
 	"fmt"
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	kexpvar "github.com/influxdata/kapacitor/expvar"
+	"github.com/influxdata/kapacitor/models"
 	"github.com/influxdata/kapacitor/pipeline"
+	"github.com/influxdata/kapacitor/timer"
+)
+
+const (
+	statAverageExecTime = "avg_exec_time_ns"
 )
 
 // A node that can be  in an executor.
@@ -37,9 +47,10 @@ type Node interface {
 	abortParentEdges()
 
 	// executing dot
-	edot(buf *bytes.Buffer)
+	edot(buf *bytes.Buffer, labels bool)
 
-	// the number of points/batches this node has collected
+	nodeStatsByGroup() map[models.GroupID]nodeStats
+
 	collectedCount() int64
 }
 
@@ -58,6 +69,9 @@ type node struct {
 	ins        []*Edge
 	outs       []*Edge
 	logger     *log.Logger
+	timer      timer.Timer
+	statsKey   string
+	statMap    *kexpvar.Map
 }
 
 func (n *node) addParentEdge(e *Edge) {
@@ -71,6 +85,16 @@ func (n *node) abortParentEdges() {
 }
 
 func (n *node) start(snapshot []byte) {
+	tags := map[string]string{
+		"task": n.et.Task.Name,
+		"node": n.Name(),
+		"type": n.et.Task.Type.String(),
+		"kind": n.Desc(),
+	}
+	n.statsKey, n.statMap = NewStatistics("nodes", tags)
+	avgExecVar := &MaxDuration{}
+	n.statMap.Set(statAverageExecTime, avgExecVar)
+	n.timer = n.et.tm.TimingService.NewTimer(avgExecVar)
 	n.errCh = make(chan error, 1)
 	go func() {
 		var err error
@@ -100,7 +124,7 @@ func (n *node) stop() {
 	if n.stopF != nil {
 		n.stopF()
 	}
-
+	DeleteStatistics(n.statsKey)
 }
 
 // no-op snapshot
@@ -125,7 +149,7 @@ func (n *node) addChild(c Node) (*Edge, error) {
 	}
 	n.children = append(n.children, c)
 
-	edge := newEdge(n.et.Task.Name, n.Name(), c.Name(), n.Provides(), n.et.tm.LogService)
+	edge := newEdge(n.et.Task.Name, n.Name(), c.Name(), n.Provides(), defaultEdgeBufferSize, n.et.tm.LogService)
 	if edge == nil {
 		return nil, fmt.Errorf("unknown edge type %s", n.Provides())
 	}
@@ -159,25 +183,125 @@ func (n *node) closeChildEdges() {
 	}
 }
 
-func (n *node) edot(buf *bytes.Buffer) {
-	for i, c := range n.children {
+func (n *node) edot(buf *bytes.Buffer, labels bool) {
+	if labels {
+		// Print all stats on node.
 		buf.Write([]byte(
-			fmt.Sprintf("%s -> %s [label=\"%d\"];\n",
+			fmt.Sprintf("\n%s [label=\"%s ",
 				n.Name(),
-				c.Name(),
-				n.outs[i].collectedCount(),
+				n.Name(),
 			),
 		))
+		n.statMap.Do(func(kv expvar.KeyValue) {
+			buf.Write([]byte(
+				fmt.Sprintf("%s=%s ",
+					kv.Key,
+					kv.Value.String(),
+				),
+			))
+		})
+		buf.Write([]byte("\"];\n"))
+
+		for i, c := range n.children {
+			buf.Write([]byte(
+				fmt.Sprintf("%s -> %s [label=\"%d\"];\n",
+					n.Name(),
+					c.Name(),
+					n.outs[i].collectedCount(),
+				),
+			))
+		}
+
+	} else {
+		// Print all stats on node.
+		buf.Write([]byte(
+			fmt.Sprintf("\n%s [",
+				n.Name(),
+			),
+		))
+		n.statMap.Do(func(kv expvar.KeyValue) {
+			buf.Write([]byte(
+				fmt.Sprintf("%s=\"%s\" ",
+					kv.Key,
+					kv.Value.String(),
+				),
+			))
+		})
+		buf.Write([]byte("];\n"))
+		for i, c := range n.children {
+			buf.Write([]byte(
+				fmt.Sprintf("%s -> %s [processed=\"%d\"];\n",
+					n.Name(),
+					c.Name(),
+					n.outs[i].collectedCount(),
+				),
+			))
+		}
 	}
 }
 
-// Return the number of points/batches this node
-// has collected.
-func (n *node) collectedCount() (c int64) {
-
-	// Count how many points each parent edge has emitted.
+func (n *node) collectedCount() (count int64) {
 	for _, in := range n.ins {
-		c += in.emittedCount()
+		count += in.emittedCount()
 	}
-	return c
+	return
+}
+
+// Statistics for a node
+type nodeStats struct {
+	Fields     models.Fields
+	Tags       models.Tags
+	Dimensions []string
+}
+
+// Return a copy of the current node statistics.
+func (n *node) nodeStatsByGroup() (stats map[models.GroupID]nodeStats) {
+	// Get the counts for just one output.
+	if len(n.outs) > 0 {
+		stats = make(map[models.GroupID]nodeStats)
+		n.outs[0].readGroupStats(func(group models.GroupID, c, e int64, tags models.Tags, dims []string) {
+			stats[group] = nodeStats{
+				Fields: models.Fields{
+					// A node's emitted count is the collected count of its output.
+					"emitted": c,
+				},
+				Tags:       tags,
+				Dimensions: dims,
+			}
+		})
+	}
+	return
+}
+
+// MaxDuration is a 64-bit int variable representing a duration in nanoseconds,that satisfies the expvar.Var interface.
+// When setting a value it will only be set if it is greater than the current value.
+type MaxDuration struct {
+	d      int64
+	setter timer.Setter
+}
+
+func (v *MaxDuration) String() string {
+	return time.Duration(v.IntValue()).String()
+}
+
+func (v *MaxDuration) IntValue() int64 {
+	return atomic.LoadInt64(&v.d)
+}
+
+// Set sets value if it is greater than current value.
+// If set was successful and a setter exists, will pass on value to setter.
+func (v *MaxDuration) Set(next int64) {
+	for {
+		cur := v.IntValue()
+		if next > cur {
+			if atomic.CompareAndSwapInt64(&v.d, cur, next) {
+				if v.setter != nil {
+					v.setter.Set(next)
+				}
+				return
+			}
+		} else {
+			return
+		}
+	}
 }

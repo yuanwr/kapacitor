@@ -21,6 +21,10 @@ import (
 	imodels "github.com/influxdb/influxdb/models"
 )
 
+const (
+	statsAlertsTriggered = "alerts_triggered"
+)
+
 // The newest state change is weighted 'weightDiff' times more than oldest state change.
 const weightDiff = 1.5
 
@@ -269,12 +273,15 @@ func newAlertNode(et *ExecutingTask, n *pipeline.AlertNode, l *log.Logger) (an *
 }
 
 func (a *AlertNode) runAlert([]byte) error {
+	a.statMap.Add(statsAlertsTriggered, 0)
 	switch a.Wants() {
 	case pipeline.StreamEdge:
 		for p, ok := a.ins[0].NextPoint(); ok; p, ok = a.ins[0].NextPoint() {
+			a.timer.Start()
 			l := a.determineLevel(p.Time, p.Fields, p.Tags)
 			state := a.updateState(l, p.Group)
 			if (a.a.UseFlapping && state.flapping) || (a.a.IsStateChangesOnly && !state.changed) {
+				a.timer.Stop()
 				continue
 			}
 			// send alert if we are not OK or we are OK and state changed (i.e recovery)
@@ -289,13 +296,13 @@ func (a *AlertNode) runAlert([]byte) error {
 				if err != nil {
 					return err
 				}
-				for _, h := range a.handlers {
-					h(ad)
-				}
+				a.handleAlert(ad)
 			}
+			a.timer.Stop()
 		}
 	case pipeline.BatchEdge:
 		for b, ok := a.ins[0].NextBatch(); ok; b, ok = a.ins[0].NextBatch() {
+			a.timer.Start()
 			triggered := false
 			for _, p := range b.Points {
 				l := a.determineLevel(p.Time, p.Fields, p.Tags)
@@ -309,9 +316,7 @@ func (a *AlertNode) runAlert([]byte) error {
 					if err != nil {
 						return err
 					}
-					for _, h := range a.handlers {
-						h(ad)
-					}
+					a.handleAlert(ad)
 					break
 				}
 			}
@@ -326,14 +331,19 @@ func (a *AlertNode) runAlert([]byte) error {
 					if err != nil {
 						return err
 					}
-					for _, h := range a.handlers {
-						h(ad)
-					}
+					a.handleAlert(ad)
 				}
 			}
+			a.timer.Stop()
 		}
 	}
 	return nil
+}
+func (a *AlertNode) handleAlert(ad *AlertData) {
+	a.statMap.Add(statsAlertsTriggered, 1)
+	for _, h := range a.handlers {
+		h(ad)
+	}
 }
 
 func (a *AlertNode) determineLevel(now time.Time, fields models.Fields, tags map[string]string) (level AlertLevel) {
@@ -636,6 +646,7 @@ func (a *AlertNode) handlePagerDuty(pd *pipeline.PagerDutyHandler, ad *AlertData
 	err := a.et.tm.PagerDutyService.Alert(
 		ad.ID,
 		ad.Message,
+		ad.Level,
 		ad.Data,
 	)
 	if err != nil {

@@ -2,11 +2,12 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
 
-	"github.com/influxdb/influxdb/client"
+	client "github.com/influxdb/influxdb/client/v2"
 	"github.com/influxdb/influxdb/models"
 )
 
@@ -30,11 +31,11 @@ func BatchPointFromPoint(p Point) BatchPoint {
 }
 
 type Batch struct {
-	Name   string            `json:"name,omitempty"`
-	Group  GroupID           `json:"-"`
-	TMax   time.Time         `json:"-"`
-	Tags   map[string]string `json:"tags,omitempty"`
-	Points []BatchPoint      `json:"points,omitempty"`
+	Name   string       `json:"name,omitempty"`
+	Group  GroupID      `json:"-"`
+	TMax   time.Time    `json:"-"`
+	Tags   Tags         `json:"tags,omitempty"`
+	Points []BatchPoint `json:"points,omitempty"`
 }
 
 func (b Batch) PointName() string {
@@ -58,9 +59,34 @@ func (b Batch) PointTags() Tags {
 	return b.Tags
 }
 
-func (b Batch) PointDimensions() []string {
-	return nil
+func (b Batch) PointDimensions() Dimensions {
+	return SortedKeys(b.Tags)
 }
+
+func (b Batch) Copy() PointInterface {
+	cb := b
+	cb.Tags = b.Tags.Copy()
+	cb.Points = make([]BatchPoint, len(b.Points))
+	for i, p := range b.Points {
+		cb.Points[i] = p
+		cb.Points[i].Fields = p.Fields.Copy()
+		cb.Points[i].Tags = p.Tags.Copy()
+	}
+	return cb
+}
+
+func (b Batch) Setter() PointSetter {
+	return &b
+}
+
+func (b *Batch) SetNewDimTag(key string, value string) {
+	b.Tags[key] = value
+	for _, p := range b.Points {
+		p.Tags[key] = value
+	}
+}
+
+func (b *Batch) UpdateGroup() {}
 
 func BatchToRow(b Batch) (row *models.Row) {
 	row = &models.Row{
@@ -99,8 +125,8 @@ func BatchToRow(b Batch) (row *models.Row) {
 }
 
 func ResultToBatches(res client.Result) ([]Batch, error) {
-	if res.Err != nil {
-		return nil, res.Err
+	if res.Err != "" {
+		return nil, errors.New(res.Err)
 	}
 	batches := make([]Batch, len(res.Series))
 	for i, series := range res.Series {

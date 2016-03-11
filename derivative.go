@@ -29,9 +29,11 @@ func (d *DerivativeNode) runDerivative([]byte) error {
 	case pipeline.StreamEdge:
 		previous := make(map[models.GroupID]models.Point)
 		for p, ok := d.ins[0].NextPoint(); ok; p, ok = d.ins[0].NextPoint() {
+			d.timer.Start()
 			pr, ok := previous[p.Group]
 			if !ok {
 				previous[p.Group] = p
+				d.timer.Stop()
 				continue
 			}
 
@@ -40,17 +42,21 @@ func (d *DerivativeNode) runDerivative([]byte) error {
 				fields := pr.Fields.Copy()
 				fields[d.d.As] = value
 				pr.Fields = fields
+				d.timer.Pause()
 				for _, child := range d.outs {
 					err := child.CollectPoint(pr)
 					if err != nil {
 						return err
 					}
 				}
+				d.timer.Resume()
 			}
 			previous[p.Group] = p
+			d.timer.Stop()
 		}
 	case pipeline.BatchEdge:
 		for b, ok := d.ins[0].NextBatch(); ok; b, ok = d.ins[0].NextBatch() {
+			d.timer.Start()
 			if len(b.Points) > 0 {
 				pr := b.Points[0]
 				var p models.BatchPoint
@@ -69,6 +75,7 @@ func (d *DerivativeNode) runDerivative([]byte) error {
 				}
 				b.Points = b.Points[:len(b.Points)-1]
 			}
+			d.timer.Stop()
 			for _, child := range d.outs {
 				err := child.CollectBatch(b)
 				if err != nil {

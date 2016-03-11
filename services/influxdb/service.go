@@ -1,6 +1,7 @@
 package influxdb
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net"
@@ -11,18 +12,18 @@ import (
 	"github.com/cenkalti/backoff"
 	"github.com/influxdata/kapacitor"
 	"github.com/influxdata/kapacitor/services/udp"
-	"github.com/influxdb/influxdb/client"
+	client "github.com/influxdb/influxdb/client/v2"
 	"github.com/influxdb/influxdb/cluster"
 )
 
 const (
-	// The name to give to all subscriptions
+	// Legacy name given to all subscriptions.
 	subName = "kapacitor"
 )
 
 // Handles requests to write or read from an InfluxDB cluster
 type Service struct {
-	configs        []client.Config
+	configs        []client.HTTPConfig
 	i              int
 	configSubs     map[subEntry]bool
 	exConfigSubs   map[subEntry]bool
@@ -31,6 +32,8 @@ type Service struct {
 	udpBuffer      int
 	udpReadBuffer  int
 	startupTimeout time.Duration
+
+	clusterID string
 
 	PointsWriter interface {
 		WritePoints(p *cluster.WritePointsRequest) error
@@ -57,11 +60,11 @@ type subInfo struct {
 }
 
 func NewService(c Config, hostname string, l *log.Logger) *Service {
-	configs := make([]client.Config, len(c.URLs))
+	clusterID := kapacitor.ClusterIDVar.StringValue()
+	configs := make([]client.HTTPConfig, len(c.URLs))
 	for i, u := range c.URLs {
-		host, _ := url.Parse(u)
-		configs[i] = client.Config{
-			URL:       *host,
+		configs[i] = client.HTTPConfig{
+			Addr:      u,
 			Username:  c.Username,
 			Password:  c.Password,
 			UserAgent: "Kapacitor",
@@ -71,14 +74,14 @@ func NewService(c Config, hostname string, l *log.Logger) *Service {
 	subs := make(map[subEntry]bool, len(c.Subscriptions))
 	for db, rps := range c.Subscriptions {
 		for _, rp := range rps {
-			se := subEntry{db, rp, subName}
+			se := subEntry{db, rp, clusterID}
 			subs[se] = true
 		}
 	}
 	exSubs := make(map[subEntry]bool, len(c.ExcludedSubscriptions))
 	for db, rps := range c.ExcludedSubscriptions {
 		for _, rp := range rps {
-			se := subEntry{db, rp, subName}
+			se := subEntry{db, rp, clusterID}
 			exSubs[se] = true
 		}
 	}
@@ -91,6 +94,7 @@ func NewService(c Config, hostname string, l *log.Logger) *Service {
 		udpBuffer:      c.UDPBuffer,
 		udpReadBuffer:  c.UDPReadBuffer,
 		startupTimeout: time.Duration(c.StartUpTimeout),
+		clusterID:      clusterID,
 	}
 }
 
@@ -112,20 +116,20 @@ func (s *Service) Close() error {
 func (s *Service) Addr() string {
 	config := s.configs[s.i]
 	s.i = (s.i + 1) % len(s.configs)
-	return config.URL.String()
+	return config.Addr
 }
 
-func (s *Service) NewClient() (c *client.Client, err error) {
+func (s *Service) NewClient() (c client.Client, err error) {
 	tries := 0
 	for tries < len(s.configs) {
 		tries++
 		config := s.configs[s.i]
 		s.i = (s.i + 1) % len(s.configs)
-		c, err = client.NewClient(config)
+		c, err = client.NewHTTPClient(config)
 		if err != nil {
 			continue
 		}
-		_, _, err = c.Ping()
+		_, _, err = c.Ping(config.Timeout)
 		if err != nil {
 			continue
 		}
@@ -140,7 +144,7 @@ func (s *Service) linkSubscriptions() error {
 	b.MaxElapsedTime = s.startupTimeout
 	ticker := backoff.NewTicker(b)
 	var err error
-	var cli *client.Client
+	var cli client.Client
 	for range ticker.C {
 		cli, err = s.NewClient()
 		if err != nil {
@@ -180,7 +184,7 @@ func (s *Service) linkSubscriptions() error {
 					se := subEntry{
 						db:   dbname,
 						rp:   rpname,
-						name: subName,
+						name: s.clusterID,
 					}
 					allSubs = append(allSubs, se)
 				}
@@ -217,9 +221,23 @@ func (s *Service) linkSubscriptions() error {
 							si.Destinations[i] = destinations[i].(string)
 						}
 					}
-					if se.name == subName {
-						existingSubs[se] = si
+				}
+				if se.name == subName {
+					// This is an old-style subscription,
+					// drop it and recreate with new name.
+					err := s.dropSub(cli, se.name, se.db, se.rp)
+					if err != nil {
+						return err
 					}
+					se.name = s.clusterID
+					err = s.createSub(cli, se.name, se.db, se.rp, si.Mode, si.Destinations)
+					if err != nil {
+						return err
+					}
+					existingSubs[se] = si
+				}
+				if se.name == s.clusterID {
+					existingSubs[se] = si
 				}
 			}
 		}
@@ -266,30 +284,56 @@ func (s *Service) linkSubscriptions() error {
 			}
 
 			// Get port from addr
-			parts := strings.Split(addr.String(), ":")
-			port := parts[len(parts)-1]
-			destination := "udp://" + s.hostname + ":" + port
+			destination := fmt.Sprintf("udp://%s:%d", s.hostname, addr.Port)
 
-			_, err = s.execQuery(
-				cli,
-				fmt.Sprintf(`CREATE SUBSCRIPTION "%s" ON "%s"."%s" DESTINATIONS ANY '%s'`,
-					se.name,
-					se.db,
-					se.rp,
-					destination,
-				),
-			)
+			err = s.createSub(cli, se.name, se.db, se.rp, "ANY", []string{destination})
 			if err != nil {
 				return err
 			}
 		}
 	}
 
-	kapacitor.NumSubscriptions.Set(numSubscriptions)
+	kapacitor.NumSubscriptionsVar.Set(numSubscriptions)
 	return nil
 }
 
-func (s *Service) startListener(db, rp string, u url.URL) (net.Addr, error) {
+func (s *Service) createSub(cli client.Client, name, db, rp, mode string, destinations []string) (err error) {
+	var buf bytes.Buffer
+	for i, dst := range destinations {
+		if i != 0 {
+			buf.Write([]byte(", "))
+		}
+		buf.Write([]byte("'"))
+		buf.Write([]byte(dst))
+		buf.Write([]byte("'"))
+	}
+	q := fmt.Sprintf(`CREATE SUBSCRIPTION "%s" ON "%s"."%s" DESTINATIONS %s %s`,
+		name,
+		db,
+		rp,
+		strings.ToUpper(mode),
+		buf.String(),
+	)
+	_, err = s.execQuery(
+		cli,
+		q,
+	)
+	return
+
+}
+func (s *Service) dropSub(cli client.Client, name, db, rp string) (err error) {
+	_, err = s.execQuery(
+		cli,
+		fmt.Sprintf(`DROP SUBSCRIPTION "%s" ON "%s"."%s"`,
+			name,
+			db,
+			rp,
+		),
+	)
+	return
+}
+
+func (s *Service) startListener(db, rp string, u url.URL) (*net.UDPAddr, error) {
 	switch u.Scheme {
 	case "udp":
 		c := udp.Config{}
@@ -314,7 +358,7 @@ func (s *Service) startListener(db, rp string, u url.URL) (net.Addr, error) {
 	return nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
 }
 
-func (s *Service) execQuery(cli *client.Client, q string) (*client.Response, error) {
+func (s *Service) execQuery(cli client.Client, q string) (*client.Response, error) {
 	query := client.Query{
 		Command: q,
 	}
@@ -322,8 +366,8 @@ func (s *Service) execQuery(cli *client.Client, q string) (*client.Response, err
 	if err != nil {
 		return nil, err
 	}
-	if resp.Err != nil {
-		return nil, resp.Err
+	if err := resp.Error(); err != nil {
+		return nil, err
 	}
 	return resp, nil
 }

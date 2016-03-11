@@ -183,6 +183,13 @@ func (n *node) dot(buf *bytes.Buffer) {
 func (n *node) Stats(interval time.Duration) *StatsNode {
 	stats := newStatsNode(n, interval)
 	n.pipeline().addSource(stats)
+	// If the source node does not have any children add a NoOpNode.
+	// This is a work around to make it so that the source node has somewhere to send its data.
+	// That way we can get stats on its behavior.
+	if len(n.Children()) == 0 {
+		noop := newNoOpNode(n.Provides())
+		n.linkChild(noop)
+	}
 	return stats
 }
 
@@ -238,14 +245,14 @@ const intervalMarker = "INTERVAL"
 //
 func (n *node) Deadman(threshold float64, interval time.Duration, expr ...tick.Node) *AlertNode {
 	dn := n.Stats(interval).
-		Derivative("collected").NonNegative()
+		Derivative("emitted").NonNegative()
 	dn.Unit = interval
 
 	an := dn.Alert()
 	critExpr := &tick.BinaryNode{
 		Operator: tick.TokenLessEqual,
 		Left: &tick.ReferenceNode{
-			Reference: "collected",
+			Reference: "emitted",
 		},
 		Right: &tick.NumberNode{
 			IsFloat: true,
@@ -352,36 +359,9 @@ func (n *chainnode) GroupBy(tag ...interface{}) *GroupByNode {
 	return g
 }
 
-// Curently you must use MapReduce
-//// Perform just the map step of a map-reduce operation.
-//// A map step must always be followed by a reduce step.
-//// See Apply for performing simple transformations.
-//// See MapReduce for performing map-reduce in one command.
-////
-//// NOTE: Map can only be applied to batch edges.
-//func (n *chainnode) Map(f interface{}) (c *MapNode) {
-//	if n.Provides() != BatchEdge {
-//		panic("cannot MapReduce non batch edge, did you forget to window the data?")
-//	}
-//	c = newMapNode(f)
-//	n.linkChild(c)
-//	return c
-//}
+// DEPRECATION WARNING: As of v0.11 you can use the new InfluxQLNode to perform map reduce functions.
+// This way of performing influxql functions will be removed in the 0.12 release.
 //
-//// Perform just the reduce step of a map-reduce operation.
-////
-//// NOTE: Reduce can only be applied to map edges.
-//func (n *chainnode) Reduce(f interface{}) (c *ReduceNode) {
-//	switch n.Provides() {
-//	case ReduceEdge:
-//		c = newReduceNode(f)
-//	default:
-//		panic("cannot Reduce non reduce edge, did you forget to map the data?")
-//	}
-//	n.linkChild(c)
-//	return c
-//}
-
 // Perform a map-reduce operation on the data.
 // The built-in functions under `influxql` provide the
 // selection,aggregation, and transformation functions

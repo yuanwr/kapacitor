@@ -4,15 +4,69 @@
 
 ### Release Notes
 
+Kapacitor is now using the functions from the new query engine in InfluxDB core.
+Along with this change is a change in the TICKscript API so that using the InfluxQL functions is easier.
+Simply call the desired method directly no need to call `.mapReduce` explicitly.
+This change now hides the mapReduce aspect and handles it internally.
+Using `.mapReduce` is officially deprecated in this release and will be remove in the next major release.
+We feel that this change improves the readability of TICKscripts and exposes less implementation details
+to the end user.
+Updating your exising TICKscripts is simple.
+If previously you had code like this:
+
+```javascript
+stream.from()...
+    .window()...
+    .mapReduce(influxql.count('value'))
+```
+then update it to look like this:
+
+```javascript
+stream.from()...
+    .window()...
+    .count('value')
+```
+
+a simple regex could fix all your existing scripts.
+
+Kapacitor now exposes more internal metrics for determining the performance of a given task.
+The internal statistics includes a new measurement named `node` that contains any stats a node provides, tagged by the task, node, task type and kind of node (i.e. window vs union).
+All nodes provide an averaged execution time for the node.
+These stats are also available in the DOT output of the Kapacitor show command.
+
+Significant performance improvements have also been added.
+In some cases Kapacitor throughput has improved by 4X.
+
+Various improvements to joining features have been implemented.
+With #144 you can now join streams with differing group by dimensions.
+
+
 ### Features
+- [#236](https://github.com/influxdata/kapacitor/issues/236): Implement batched group by
 - [#231](https://github.com/influxdata/kapacitor/pull/231): Add ShiftNode so values can be shifted in time for joining/comparisons.
+- [#190](https://github.com/influxdata/kapacitor/issues/190): BREAKING: Deadman's switch now triggers off emitted counts and is grouped by to original grouping of the data.
+    The breaking change is that the 'collected' stat is no longer output for `.stats` and has been replaced by `emitted`.
+- [#145](https://github.com/influxdata/kapacitor/issues/145): The InfluxDB Out Node now writes data to InfluxDB in buffers.
+- [#215](https://github.com/influxdata/kapacitor/issues/215): Add performance metrics to nodes for average execution times and node throughput values.
+- [#144](https://github.com/influxdata/kapacitor/issues/144): Can now join streams with differing dimensions using the join.On property.
+- [#249](https://github.com/influxdata/kapacitor/issues/249): Can now use InfluxQL functions directly instead of via the MapReduce method. Example `stream.from().count()`.
 
 
 ### Bugfixes
 - [#199](https://github.com/influxdata/kapacitor/issues/199): BREAKING: Various fixes for the Alerta integration.
     The `event` property has been removed from the Alerta node and is now set as the value of the alert ID.
+- [#232](https://github.com/influxdata/kapacitor/issues/232): Better error message for alert integrations. Better error message for VictorOps 404 response.
+- [#231](https://github.com/influxdata/kapacitor/issues/231): Fix window logic when there were gaps in the data stream longer than window every value.
+- [#213](https://github.com/influxdata/kapacitor/issues/231): Add SourceStreamNode so that yuou must always first call `.from` on the `stream` object before filtering it, so as to not create confusing to understand TICKscripts.
+- [#255](https://github.com/influxdata/kapacitor/issues/255): Add OPTIONS handler for task delete method so it can be preflighted.
+- [#258](https://github.com/influxdata/kapacitor/issues/258): Fix UDP internal metrics, change subscriptions to use clusterID.
+- [#240](https://github.com/influxdata/kapacitor/issues/240): BREAKING: Fix issues with Sensu integration. The breaking change is that the config no longer takes a `url` but rather a `host` option since the communication is raw TCP rather HTTP.
+- [#270](https://github.com/influxdata/kapacitor/issues/270): The HTTP server will now gracefully stop.
+- [#300](https://github.com/influxdata/kapacitor/issues/300): Add OPTIONS method to /recording endpoint for deletes.
+- [#304](https://github.com/influxdata/kapacitor/issues/304): Fix panic if recording query but do not have an InfluxDB instance configured
+- [#289](https://github.com/influxdata/kapacitor/issues/289): Add better error handling to batch node.
 
-## v0.10.1 [2013-02-08]
+## v0.10.1 [2016-02-08]
 
 ### Release Notes
 

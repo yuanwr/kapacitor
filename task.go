@@ -71,11 +71,15 @@ type ExecutingTask struct {
 	source  Node
 	outputs map[string]Output
 	// node lookup from pipeline.ID -> Node
-	lookup          map[pipeline.ID]Node
-	nodes           []Node
-	stopSnapshotter chan struct{}
-	wg              sync.WaitGroup
-	logger          *log.Logger
+	lookup   map[pipeline.ID]Node
+	nodes    []Node
+	stopping chan struct{}
+	wg       sync.WaitGroup
+	logger   *log.Logger
+
+	// Mutex for throughput var
+	tmu        sync.RWMutex
+	throughput float64
 }
 
 // Create a new  task from a defined kapacitor.
@@ -178,18 +182,19 @@ func (et *ExecutingTask) start(ins []*Edge, snapshot *TaskSnapshot) error {
 	if err != nil {
 		return err
 	}
+	et.stopping = make(chan struct{})
 	if et.Task.SnapshotInterval > 0 {
 		et.wg.Add(1)
-		et.stopSnapshotter = make(chan struct{})
 		go et.runSnapshotter()
 	}
+	// Start calcThroughput
+	et.wg.Add(1)
+	go et.calcThroughput()
 	return nil
 }
 
 func (et *ExecutingTask) stop() (err error) {
-	if et.Task.SnapshotInterval > 0 {
-		close(et.stopSnapshotter)
-	}
+	close(et.stopping)
 	et.walk(func(n Node) error {
 		n.stop()
 		e := n.Err()
@@ -285,15 +290,36 @@ func (et *ExecutingTask) registerOutput(name string, o Output) {
 
 // Return a graphviz .dot formatted byte array.
 // Label edges with relavant execution information.
-func (et *ExecutingTask) EDot() []byte {
+func (et *ExecutingTask) EDot(labels bool) []byte {
 
 	var buf bytes.Buffer
 
 	buf.Write([]byte("digraph "))
 	buf.Write([]byte(et.Task.Name))
 	buf.Write([]byte(" {\n"))
+	// Write graph attributes
+	unit := "points"
+	if et.Task.Type == BatchTask {
+		unit = "batches"
+	}
+	if labels {
+		buf.Write([]byte(
+			fmt.Sprintf("graph [label=\"Throughput: %0.2f %s/s\"];\n",
+				et.getThroughput(),
+				unit,
+			),
+		))
+	} else {
+		buf.Write([]byte(
+			fmt.Sprintf("graph [throughput=\"%0.2f %s/s\"];\n",
+				et.getThroughput(),
+				unit,
+			),
+		))
+	}
+
 	et.walk(func(n Node) error {
-		n.edot(&buf)
+		n.edot(&buf, labels)
 		return nil
 	})
 	buf.Write([]byte("}"))
@@ -301,11 +327,45 @@ func (et *ExecutingTask) EDot() []byte {
 	return buf.Bytes()
 }
 
+// Return the current throughput value.
+func (et *ExecutingTask) getThroughput() float64 {
+	et.tmu.RLock()
+	defer et.tmu.RUnlock()
+	return et.throughput
+}
+
+func (et *ExecutingTask) calcThroughput() {
+	defer et.wg.Done()
+	var previous int64
+	last := time.Now()
+	ticker := time.NewTicker(time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			current := et.source.collectedCount()
+			now := time.Now()
+			elapsed := float64(now.Sub(last)) / float64(time.Second)
+
+			et.tmu.Lock()
+			et.throughput = float64(current-previous) / elapsed
+			et.tmu.Unlock()
+
+			last = now
+			previous = current
+
+		case <-et.stopping:
+			return
+		}
+	}
+}
+
 // Create a  node from a given pipeline node.
 func (et *ExecutingTask) createNode(p pipeline.Node, l *log.Logger) (Node, error) {
 	switch t := p.(type) {
 	case *pipeline.StreamNode:
 		return newStreamNode(et, t, l)
+	case *pipeline.SourceStreamNode:
+		return newSourceStreamNode(et, t, l)
 	case *pipeline.SourceBatchNode:
 		return newSourceBatchNode(et, t, l)
 	case *pipeline.BatchNode:
@@ -342,6 +402,10 @@ func (et *ExecutingTask) createNode(p pipeline.Node, l *log.Logger) (Node, error
 		return newStatsNode(et, t, l)
 	case *pipeline.ShiftNode:
 		return newShiftNode(et, t, l)
+	case *pipeline.NoOpNode:
+		return newNoOpNode(et, t, l)
+	case *pipeline.InfluxQLNode:
+		return newInfluxQLNode(et, t, l)
 	default:
 		return nil, fmt.Errorf("unknown pipeline node type %T", p)
 	}
@@ -374,7 +438,7 @@ func (et *ExecutingTask) runSnapshotter() {
 	// Wait random duration to splay snapshot events across interval
 	select {
 	case <-time.After(time.Duration(rand.Float64() * float64(et.Task.SnapshotInterval))):
-	case <-et.stopSnapshotter:
+	case <-et.stopping:
 		return
 	}
 	ticker := time.NewTicker(et.Task.SnapshotInterval)
@@ -398,7 +462,7 @@ func (et *ExecutingTask) runSnapshotter() {
 					et.logger.Println("E! failed to save task snapshot", et.Task.Name, err)
 				}
 			}
-		case <-et.stopSnapshotter:
+		case <-et.stopping:
 			return
 		}
 	}

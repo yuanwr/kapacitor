@@ -6,14 +6,13 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"reflect"
 	"time"
 
 	"github.com/influxdata/kapacitor"
 	"github.com/influxdata/kapacitor/wlog"
-	"github.com/influxdb/influxdb/client"
+	client "github.com/influxdb/influxdb/client/v2"
 	"github.com/influxdb/influxdb/influxql"
 )
 
@@ -28,11 +27,9 @@ func NewMockInfluxDBService(h http.Handler) *MockInfluxDBService {
 	}
 }
 
-func (m *MockInfluxDBService) NewClient() (*client.Client, error) {
-	u, _ := url.Parse(m.ts.URL)
-	return client.NewClient(client.Config{
-		URL:       *u,
-		Precision: "s",
+func (m *MockInfluxDBService) NewClient() (client.Client, error) {
+	return client.NewHTTPClient(client.HTTPConfig{
+		Addr: m.ts.URL,
 	})
 
 }
@@ -84,13 +81,18 @@ func compareResultsIgnoreSeriesOrder(exp, got kapacitor.Result) (bool, string) {
 	for i := range exp.Series {
 		// Find series with same name
 		var j int
+		found := false
 		for j = range set {
 			if exp.Series[i].Name == got.Series[j].Name &&
 				reflect.DeepEqual(exp.Series[i].Tags, got.Series[j].Tags) {
 				// found matching series
 				delete(set, j)
+				found = true
 				break
 			}
+		}
+		if !found {
+			return false, fmt.Sprintf("could not find matching series: %s %v", exp.Series[i].Name, exp.Series[i].Tags)
 		}
 		if !reflect.DeepEqual(exp.Series[i].Columns, got.Series[j].Columns) {
 			return false, fmt.Sprintf("unexpected series columns: i: %d \nexp %v \ngot %v", i, exp.Series[i].Columns, got.Series[j].Columns)
